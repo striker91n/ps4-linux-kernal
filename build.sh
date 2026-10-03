@@ -574,6 +574,10 @@ if [[ "$DO_BUILD" == "1" ]]; then
         scripts/config --enable  CONFIG_DMI_SYSFS
         scripts/config --enable  CONFIG_FW_CFG_SYSFS
 
+        # LSM / ptrace support -- required by Sober / Roblox (vinegarhq/sober#1792)
+        scripts/config --enable  CONFIG_SECURITY
+        scripts/config --enable  CONFIG_SECURITY_YAMA
+
         scripts/config --enable  CONFIG_CPU_FREQ_GOV_REFLEX
         scripts/config --enable  CONFIG_CPU_FREQ_DEFAULT_GOV_SCHEDUTIL
         scripts/config --enable  CONFIG_CPU_FREQ_GOV_SCHEDUTIL
