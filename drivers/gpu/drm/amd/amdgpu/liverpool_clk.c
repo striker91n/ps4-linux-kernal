@@ -30,8 +30,22 @@
  * by-1, full SPLL output) from cik_common_hw_init(), before any GFX
  * ring or shader work begins.
  *
- * SCLKDIRCNTLEN is kept set permanently. This prevents any dormant
- * DPM path from lowering the clock autonomously.
+ * ============================================================
+ * REVISION (this build): take SCLK away from the SMC first
+ * ============================================================
+ * The original code wrote CG_SCLK_CNTL once and it did NOT stick —
+ * the SMC dynamic PM path reverted DIRCNTLEN/DIRCNTLDIV back to 0,
+ * giving "readback DID mismatch - expected 1 got 0" and leaving the
+ * GPU at the strap clock.
+ *
+ * This revision:
+ *   1. Clears DYNAMIC_PM_EN in SCLK_PWRMGT_CNTL so the SMC stops
+ *      re-driving the SCLK divider, and logs the before/after value.
+ *   2. Forces DID=1 with a RETRY loop (up to 5 attempts), logging
+ *      CG_SCLK_CNTL/STATUS after every attempt so the dmesg tells us
+ *      exactly what the hardware did.
+ *   3. Re-checks after each attempt and only reports success when
+ *      DIRCNTLEN=1 and DIRCNTLDIV==1 actually read back.
  *
  * ============================================================
  * SPLL State After Soft-Reset
@@ -42,29 +56,13 @@
  * by the BIOS/hypervisor before kexec. Only the post-divider (DID)
  * is reset. Forcing DID=1 restores the full SPLL output.
  *
- * If SPLL PDIVA > 4 at init time the SPLL may have been reconfigured
- * by the soft-reset. The function logs PDIVA and FBDIV in that case
- * for follow-up SPLL reprogramming support.
- *
- * ============================================================
- * Voltage
- * ============================================================
- * The BIOS/hypervisor that configured the SPLL also set VID rails to
- * operational levels before kexec. A GFX soft-reset does not touch
- * the power plane.
- *
- * The EMC (Aeolia/Belize/Baikal, ARM Cortex-M3) provides an
- * independent hardware thermal kill at 72 C (GPU domain, ICC command
- * 0x0B/0x05 domain 2) and 97 C (APU shutdown) regardless of what
- * Linux writes into the clock registers.
- *
  * ============================================================
  * Register Reference
  * ============================================================
  * All registers accessed via RREG32_SMC / WREG32_SMC (SMC indirect
  * at mmSMC_IND_INDEX_0 / mmSMC_IND_DATA_0, initialised in
  * cik_common_early_init before this function is called).
- * Source: bonaire.rai, GCK block. See liverpool_clk.h for field map.
+ * Source: bonaire.rai / cikd.h, GCK block.
  */
 
 #include <linux/delay.h>
@@ -108,23 +106,26 @@
 #define SCLK_STARTUP_DID                0xe000304c
 #define   SCLKSTARTUPDID_MASK             0x7f
 
+/* SCLK power-management control: lets us stop the SMC re-driving SCLK. */
+#define SCLK_PWRMGT_CNTL                0xc0200008
+#define   SCLK_PWRMGT_OFF                 BIT(0)
+#define   SCLK_DYNAMIC_PM_EN              BIT(21)
+
 #define LIVERPOOL_TARGET_SCLK_DID       1
 #define LIVERPOOL_CLK_TIMEOUT_US        10
 #define LIVERPOOL_CLK_TIMEOUT_ITER      1000
+#define LIVERPOOL_CLK_MAX_ATTEMPTS      5
 
-/* ============================================================
+/**
  * liverpool_clk_force_max - Force GPU SCLK to maximum
- * ============================================================
  * @adev: amdgpu device pointer (CHIP_LIVERPOOL or CHIP_GLADIUS)
  *
- * Called from cik_common_hw_init() before any GFX or SDMA ring
- * work. Uses CG_SCLK_CNTL direct-control mode so the change takes
- * effect without going through the SMU message protocol.
+ * Called from cik_common_hw_init() before any GFX or SDMA ring work.
+ * Uses CG_SCLK_CNTL direct-control mode (bypassing the SMU message
+ * protocol). First clears SCLK_PWRMGT_CNTL.DYNAMIC_PM_EN so the SMC
+ * stops reverting the divider, then forces DID=1 with retries.
  *
- * Logs SPLL state (PDIVA, FBDIV) at init time. A PDIVA > 4 warning
- * means the SPLL may need reprogramming â€” report the values.
- *
- * Returns 0 on success, -ETIMEDOUT if hardware does not respond.
+ * Returns 0 if DIRCNTLEN=1 && DIRCNTLDIV==1 read back, else -ETIMEDOUT.
  */
 int liverpool_clk_force_max(struct amdgpu_device *adev)
 {
@@ -132,9 +133,8 @@ int liverpool_clk_force_max(struct amdgpu_device *adev)
 	u32 spll_freq_id_startup, spll_freq_id_max;
 	u32 startup_did, current_did;
 	u32 spll_pdiva, spll_fbdiv;
-	u32 cntl, status;
-	bool expected_done_tog;
-	int i;
+	u32 cntl, status, pwrmgt;
+	int i, attempt;
 
 	spll_fuses = RREG32_SMC(GCK_SPLL_FUSES);
 	sclk_fuses = RREG32_SMC(GCK_SCLK_FUSES);
@@ -158,7 +158,7 @@ int liverpool_clk_force_max(struct amdgpu_device *adev)
 
 	if (spll_pdiva > 4)
 		dev_warn(adev->dev,
-			 "Liverpool CLK: SPLL PDIVA=%u > 4 â€” SPLL may have been "
+			 "Liverpool CLK: SPLL PDIVA=%u > 4 - SPLL may have been "
 			 "reconfigured by soft-reset. Report PDIVA+FBDIV.\n",
 			 spll_pdiva);
 
@@ -182,51 +182,61 @@ int liverpool_clk_force_max(struct amdgpu_device *adev)
 		return 0;
 	}
 
-	for (i = 0; i < LIVERPOOL_CLK_TIMEOUT_ITER; i++) {
-		if (RREG32_SMC(CG_SCLK_STATUS) & SCLK_STATUS_DONE)
-			break;
-		udelay(LIVERPOOL_CLK_TIMEOUT_US);
-	}
-	if (i == LIVERPOOL_CLK_TIMEOUT_ITER) {
-		dev_err(adev->dev,
-			"Liverpool CLK: timed out waiting for SCLK idle (0x%08x)\n",
-			RREG32_SMC(CG_SCLK_STATUS));
-		return -ETIMEDOUT;
-	}
-
-	cntl &= ~SCLK_DIRCNTL_DIV_MASK;
-	cntl |= (LIVERPOOL_TARGET_SCLK_DID << SCLK_DIRCNTL_DIV_SHIFT) & SCLK_DIRCNTL_DIV_MASK;
-	cntl |= SCLK_DIRCNTL_EN;
-	cntl ^= SCLK_DIRCNTL_TOG;
-	expected_done_tog = !!(cntl & SCLK_DIRCNTL_TOG);
-	WREG32_SMC(CG_SCLK_CNTL, cntl);
-
-	for (i = 0; i < LIVERPOOL_CLK_TIMEOUT_ITER; i++) {
-		status = RREG32_SMC(CG_SCLK_STATUS);
-		if (!!(status & SCLK_DIRCNTL_DONE_TOG) == expected_done_tog)
-			break;
-		udelay(LIVERPOOL_CLK_TIMEOUT_US);
-	}
-	if (i == LIVERPOOL_CLK_TIMEOUT_ITER) {
-		dev_err(adev->dev,
-			"Liverpool CLK: timed out waiting for force done (0x%08x)\n",
-			RREG32_SMC(CG_SCLK_STATUS));
-		return -ETIMEDOUT;
-	}
-
-	cntl   = RREG32_SMC(CG_SCLK_CNTL);
-	status = RREG32_SMC(CG_SCLK_STATUS);
+	/* Step 1: stop the SMC dynamic PM from re-driving the SCLK divider. */
+	pwrmgt = RREG32_SMC(SCLK_PWRMGT_CNTL);
 	dev_info(adev->dev,
-		 "Liverpool CLK: force done. CG_SCLK_CNTL=0x%08x DIRCNTLDIV=%u status=0x%08x\n",
-		 cntl,
-		 (cntl & SCLK_DIRCNTL_DIV_MASK) >> SCLK_DIRCNTL_DIV_SHIFT,
-		 status);
+		 "Liverpool CLK: SCLK_PWRMGT_CNTL=0x%08x (DYNAMIC_PM_EN=%u PWRMGT_OFF=%u)\n",
+		 pwrmgt, !!(pwrmgt & SCLK_DYNAMIC_PM_EN), !!(pwrmgt & SCLK_PWRMGT_OFF));
+	if (pwrmgt & SCLK_DYNAMIC_PM_EN) {
+		pwrmgt &= ~SCLK_DYNAMIC_PM_EN;
+		WREG32_SMC(SCLK_PWRMGT_CNTL, pwrmgt);
+		udelay(50);
+		dev_info(adev->dev,
+			 "Liverpool CLK: SCLK_PWRMGT_CNTL after clear DYNAMIC_PM_EN=0x%08x\n",
+			 RREG32_SMC(SCLK_PWRMGT_CNTL));
+	}
 
-	if (((cntl & SCLK_DIRCNTL_DIV_MASK) >> SCLK_DIRCNTL_DIV_SHIFT) != LIVERPOOL_TARGET_SCLK_DID)
-		dev_warn(adev->dev,
-			 "Liverpool CLK: readback DID mismatch â€” expected %u got %u\n",
-			 LIVERPOOL_TARGET_SCLK_DID,
-			 (cntl & SCLK_DIRCNTL_DIV_MASK) >> SCLK_DIRCNTL_DIV_SHIFT);
+	/* Step 2: force DID=1, retrying because the SMC may still fight us. */
+	for (attempt = 0; attempt < LIVERPOOL_CLK_MAX_ATTEMPTS; attempt++) {
+		for (i = 0; i < LIVERPOOL_CLK_TIMEOUT_ITER; i++) {
+			if (RREG32_SMC(CG_SCLK_STATUS) & SCLK_STATUS_DONE)
+				break;
+			udelay(LIVERPOOL_CLK_TIMEOUT_US);
+		}
 
-	return 0;
+		cntl = RREG32_SMC(CG_SCLK_CNTL);
+		cntl &= ~SCLK_DIRCNTL_DIV_MASK;
+		cntl |= (LIVERPOOL_TARGET_SCLK_DID << SCLK_DIRCNTL_DIV_SHIFT) & SCLK_DIRCNTL_DIV_MASK;
+		cntl |= SCLK_DIRCNTL_EN;
+		cntl ^= SCLK_DIRCNTL_TOG;
+		WREG32_SMC(CG_SCLK_CNTL, cntl);
+
+		for (i = 0; i < LIVERPOOL_CLK_TIMEOUT_ITER; i++) {
+			status = RREG32_SMC(CG_SCLK_STATUS);
+			if (status & (SCLK_DIRCNTL_DONE_TOG | SCLK_FORCE_STATUS_DONE))
+				break;
+			udelay(LIVERPOOL_CLK_TIMEOUT_US);
+		}
+
+		cntl   = RREG32_SMC(CG_SCLK_CNTL);
+		status = RREG32_SMC(CG_SCLK_STATUS);
+		dev_info(adev->dev,
+			 "Liverpool CLK: attempt %d: CG_SCLK_CNTL=0x%08x DIRCNTLEN=%u DIRCNTLDIV=%u status=0x%08x\n",
+			 attempt, cntl, !!(cntl & SCLK_DIRCNTL_EN),
+			 (cntl & SCLK_DIRCNTL_DIV_MASK) >> SCLK_DIRCNTL_DIV_SHIFT,
+			 status);
+
+		if ((cntl & SCLK_DIRCNTL_EN) &&
+		    ((cntl & SCLK_DIRCNTL_DIV_MASK) >> SCLK_DIRCNTL_DIV_SHIFT) == LIVERPOOL_TARGET_SCLK_DID) {
+			dev_info(adev->dev,
+				 "Liverpool CLK: DID=1 achieved on attempt %d.\n", attempt);
+			return 0;
+		}
+		udelay(1000);
+	}
+
+	dev_warn(adev->dev,
+		 "Liverpool CLK: failed to force DID=1 after %d attempts - GPU stays at strap clock.\n",
+		 LIVERPOOL_CLK_MAX_ATTEMPTS);
+	return -ETIMEDOUT;
 }
