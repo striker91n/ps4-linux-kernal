@@ -254,6 +254,21 @@ MAKE_OPTS=(
     HOSTCFLAGS="${HOSTCFLAGS}"
 )
 
+# --- ccache: reuse compiled objects across clean/full rebuilds --------------
+# CCACHE_DIR lives inside the mounted workspace so the GitHub Actions
+# "kernel-source-host" cache carries it between runs. /usr/lib/ccache puts a
+# ccache-wrapped `clang` first in PATH; kbuild (LLVM=1) then compiles via ccache.
+export CCACHE_DIR="${CCACHE_DIR:-${PWD}/.ccache}"
+export CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-4G}"
+export CCACHE_COMPILERCHECK="${CCACHE_COMPILERCHECK:-content}"
+if command -v ccache >/dev/null 2>&1; then
+    mkdir -p "${CCACHE_DIR}"
+    export PATH="/usr/lib/ccache:${PATH}"
+    echo -e "\e[1;34m[*]\e[0m ccache enabled (dir=${CCACHE_DIR}, max=${CCACHE_MAXSIZE})"
+else
+    echo -e "\e[1;33m[!]\e[0m ccache not installed; compiling without it"
+fi
+
 if [[ ! -f Makefile ]] || ! grep -q "KERNELRELEASE" Makefile 2>/dev/null; then
     echo -e "\e[1;31mERROR:\e[0m Run this from the kernel source root." >&2
     exit 1
@@ -261,8 +276,12 @@ fi
 
 # if [[ ! -f .config ]]; then  # We need to update the config file even if .config exists from a prev. cached build
 if [[ -f config ]]; then
-    echo -e "\e[1;34m[*]\e[0m Moving 'config' -> '.config'"
-    mv config .config
+    if [[ -f .config ]] && cmp -s config .config; then
+        echo -e "\e[1;34m[*]\e[0m config == .config; keeping cached .config (preserve incremental state)"
+    else
+        echo -e "\e[1;34m[*]\e[0m Moving 'config' -> '.config'"
+        mv config .config
+    fi
 else
     echo -e "\e[1;31mERROR:\e[0m No .config found." >&2
     exit 1
@@ -637,6 +656,8 @@ if [[ "$DO_BUILD" == "1" ]]; then
     CURRENT_LTO_LABEL="$(lto_label)"
     echo -e "\e[1;34m[*]\e[0m Building bzImage [profile: ${PROFILE}, LTO: ${CURRENT_LTO_LABEL}] with ${JOBS} jobs..."
     time make "${MAKE_OPTS[@]}" bzImage
+
+    command -v ccache >/dev/null 2>&1 && { echo -e "\e[1;34m[*]\e[0m ccache statistics:"; ccache -s 2>/dev/null | sed 's/^/    /'; } || true
 
     BZIMAGE="arch/x86/boot/bzImage"
     if [[ ! -f "${BZIMAGE}" ]]; then
