@@ -256,15 +256,20 @@ MAKE_OPTS=(
 
 # --- ccache: reuse compiled objects across clean/full rebuilds --------------
 # CCACHE_DIR lives inside the mounted workspace so the GitHub Actions
-# "kernel-source-host" cache carries it between runs. /usr/lib/ccache puts a
-# ccache-wrapped `clang` first in PATH; kbuild (LLVM=1) then compiles via ccache.
+# "kernel-source-host" cache carries it between runs. We add a PATH of ccache
+# compiler shims; kbuild (LLVM=1) then compiles through ccache.
 export CCACHE_DIR="${CCACHE_DIR:-${PWD}/.ccache}"
 export CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-4G}"
 export CCACHE_COMPILERCHECK="${CCACHE_COMPILERCHECK:-content}"
 if command -v ccache >/dev/null 2>&1; then
-    mkdir -p "${CCACHE_DIR}"
+    mkdir -p "${CCACHE_DIR}" /usr/lib/ccache
+    # Ubuntu ships some shims, but create any that are missing so this works
+    # regardless of the ccache package layout.
+    for c in clang clang++ cc gcc g++; do
+        [ -e "/usr/lib/ccache/$c" ] || ln -sf "$(command -v ccache)" "/usr/lib/ccache/$c" 2>/dev/null || true
+    done
     export PATH="/usr/lib/ccache:${PATH}"
-    echo -e "\e[1;34m[*]\e[0m ccache enabled (dir=${CCACHE_DIR}, max=${CCACHE_MAXSIZE})"
+    echo -e "\e[1;34m[*]\e[0m ccache enabled (dir=${CCACHE_DIR}, max=${CCACHE_MAXSIZE}); clang -> $(command -v clang)"
 else
     echo -e "\e[1;33m[!]\e[0m ccache not installed; compiling without it"
 fi
