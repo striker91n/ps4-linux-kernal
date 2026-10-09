@@ -837,6 +837,17 @@ static void ps4_bridge_enable(struct drm_bridge *bridge)
 
 out:
 	mutex_lock(&mn_bridge->mutex);
+	if (success) {
+		/*
+		 * Insurance: re-issue the VMUTE clear as its own ICC
+		 * transaction so a truncated enable queue cannot strand the
+		 * un-mute and mute the panel for the rest of the boot.
+		 */
+		cq_init(&mn_bridge->cq, 4);
+		cq_writereg(&mn_bridge->cq, VMUTECNT, VMUTECNT_LINEWIDTH_90);
+		if (cq_exec(&mn_bridge->cq) < 0)
+			DRM_ERROR("ps4_bridge: forced un-mute failed\n");
+	}
 	mn_bridge->enabled = success;
 	mn_bridge->enabling = false;
 	mutex_unlock(&mn_bridge->mutex);
@@ -861,8 +872,17 @@ static void ps4_bridge_disable(struct drm_bridge *bridge)
 	DRM_DEBUG_KMS("ps4_bridge_disable\n");
 
 	cq_init(&mn_bridge->cq, 4);
+	/*
+	 * PS4 fix (aday1/ps4-hdmi-blackscreen): do NOT mute here.
+	 * .disable runs before the first userspace modeset, and the matching
+	 * un-mute is the last command of the enable queue. If that queue is
+	 * truncated, the panel stays permanently black while the TV still
+	 * reports 1080p60. Leaving video unmuted keeps the console alive.
+	 */
+#if 0
 	cq_writereg(&mn_bridge->cq, VMUTECNT, VMUTECNT_LINEWIDTH_90 | VMUTECNT_VMUTE_MUTE_NORMAL);
 	cq_writereg(&mn_bridge->cq, INFENA, 0x00);
+#endif
 	if (cq_exec(&mn_bridge->cq) < 0) {
 		DRM_ERROR("Failed to disable bridge\n");
 	}
