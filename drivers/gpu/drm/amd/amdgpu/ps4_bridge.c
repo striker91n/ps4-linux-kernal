@@ -437,9 +437,31 @@ void ps4_bridge_mode_set(struct drm_bridge *bridge,
 	/* This gets called before pre_enable/enable, so we just stash
 	 * the vic ID for later */
 	mn_bridge->mode = drm_match_cea_mode(adjusted_mode);
+
+	/*
+	 * PS4 fix: the forced synthetic EDID (edid/my_edid.bin) is a base-block
+	 * only EDID with no CEA-861 extension, so its 1920x1080@60 detailed
+	 * timing does not match the CEA table and drm_match_cea_mode() returns 0
+	 * (VIC 0). That timing is exposed to userspace alongside the driver's own
+	 * CEA mode_1080p, and KWin/kscreen can select it; the bridge then rejects
+	 * the whole modeset ("non-CEA mode" / "mode not available") and the
+	 * display stays black. Map the well-known timings back to their CEA VIC so
+	 * a modeset succeeds no matter which duplicate userspace picks.
+	 */
+	if (!mn_bridge->mode) {
+		unsigned int vrefresh = drm_mode_vrefresh(adjusted_mode);
+
+		if (adjusted_mode->hdisplay == 1920 &&
+		    adjusted_mode->vdisplay == 1080)
+			mn_bridge->mode = (vrefresh >= 100) ? 63 : 16;
+		else if (adjusted_mode->hdisplay == 1280 &&
+			 adjusted_mode->vdisplay == 720)
+			mn_bridge->mode = 4;
+	}
+
 	DRM_DEBUG_KMS("vic mode: %d\n", mn_bridge->mode);
 	if (!mn_bridge->mode) {
-		DRM_ERROR("attempted to set non-CEA mode\n");
+		DRM_ERROR("attempted to set unsupported non-CEA mode\n");
 	}
 }
 
