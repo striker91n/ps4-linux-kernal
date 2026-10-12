@@ -492,13 +492,14 @@ if [[ "$DO_BUILD" == "1" ]]; then
     scripts/config --enable  CONFIG_DEBUG_INFO_BTF_MODULES
 
     # Runtime debug / tracing
-    scripts/config --disable CONFIG_DEBUG_KERNEL
+    scripts/config --enable  CONFIG_DEBUG_KERNEL
     scripts/config --disable CONFIG_PROVE_LOCKING
     scripts/config --disable CONFIG_LOCKDEP
     scripts/config --disable CONFIG_KASAN
-    scripts/config --disable CONFIG_FTRACE
+    scripts/config --enable  CONFIG_FTRACE
     scripts/config --disable CONFIG_SCHED_DEBUG
-    scripts/config --disable CONFIG_DEBUG_FS
+    scripts/config --enable  CONFIG_DEBUG_FS
+    scripts/config --enable  CONFIG_FUNCTION_TRACER
 
     # Mitigation / hardening trims
     scripts/config --disable CONFIG_CPU_MITIGATIONS
