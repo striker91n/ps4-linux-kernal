@@ -25,6 +25,7 @@
  *          Jerome Glisse
  */
 
+#include <linux/delay.h>
 #include <drm/amdgpu_drm.h>
 #include <drm/display/drm_dp_helper.h>
 
@@ -773,13 +774,22 @@ void amdgpu_atombios_dp_link_train(struct drm_encoder *encoder,
 	dp_info.dp_clock = dig_connector->dp_clock;
 	dp_info.aux = &amdgpu_connector->ddc_bus->aux;
 
-	if (amdgpu_atombios_dp_link_train_init(&dp_info))
-		goto done;
-	if (amdgpu_atombios_dp_link_train_cr(&dp_info))
-		goto done;
-	if (amdgpu_atombios_dp_link_train_ce(&dp_info))
-		goto done;
-done:
-	if (amdgpu_atombios_dp_link_train_finish(&dp_info))
-		return;
+	{
+		int attempt;
+	
+		for (attempt = 0; attempt < 10; attempt++) {
+			if (attempt > 0)
+				msleep(200);
+	
+			amdgpu_atombios_dp_link_train_init(&dp_info);
+	
+			if (amdgpu_atombios_dp_link_train_cr(&dp_info) == 0 &&
+			    amdgpu_atombios_dp_link_train_ce(&dp_info) == 0) {
+				amdgpu_atombios_dp_link_train_finish(&dp_info);
+				return;
+			}
+	
+			amdgpu_atombios_dp_link_train_finish(&dp_info);
+		}
+	}
 }
